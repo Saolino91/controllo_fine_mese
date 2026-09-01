@@ -104,24 +104,67 @@ def generate_encoding_candidates(raw_bytes: bytes, n_top=4):
     return scored_sorted[:n_top]
 
 
-def guess_separator_from_text(text: str):
-    lines = "\n".join(text.splitlines()[:20])
+CANDIDATE_SEPS = ["\t", ";", "|", ","]
+
+
+def _score_separator(lines, sep):
+    """Valuta un separatore: quante intestazioni note riconosce e quanto e' regolare.
+
+    Ritorna una tupla ordinabile (keyword_trovate, righe_regolari, n_campi).
+    Un separatore che produce una sola colonna e' sempre scartato.
+    """
     try:
-        sniffer = csv.Sniffer()
-        dialect = sniffer.sniff(lines)
-        sep = dialect.delimiter
-        if sep.isspace():
-            sep = "\t"
+        rows = [row for row in csv.reader(lines, delimiter=sep)]
     except Exception:
-        if "\t" in lines:
-            sep = "\t"
-        elif ";" in lines:
-            sep = ";"
-        elif "," in lines:
-            sep = ","
-        else:
-            sep = r"\s+"
-    return sep
+        return (-1, -1, -1)
+    if not rows or len(rows[0]) < 2:
+        return (-1, -1, -1)
+
+    header = [str(c).strip().lower() for c in rows[0]]
+    kw = sum(1 for c in header if c in {k.lower() for k in KEYWORDS}
+             or any(c.startswith(k.lower()) for k in KEYWORDS))
+
+    hdr_len = len(rows[0])
+    # le righe dati possono avere colonne in piu' (indennita' multiple): va bene,
+    # quello che conta e' che non ne abbiano di meno.
+    regular = sum(1 for r in rows[1:] if len(r) >= hdr_len)
+    return (kw, regular, hdr_len)
+
+
+def guess_separator_from_text(text: str):
+    """Individua il separatore reale del file.
+
+    NOTA: qui NON si usa csv.Sniffer come prima scelta. Su questo tracciato
+    Sniffer sceglieva la lettera "I" come delimitatore (e' frequente e regolare
+    in nomi come MARINA/RICCARDO e nelle intestazioni InizioC/FineC): il file
+    veniva spezzato in 4 colonne senza senso, nessuna colonna "Matricola" o
+    "TurnoE" veniva riconosciuta e il PDF usciva vuoto senza alcun errore.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip() != ""][:50]
+    if not lines:
+        return "\t"
+
+    best_sep, best_score = None, (0, -1, -1)
+    for sep in CANDIDATE_SEPS:
+        score = _score_separator(lines, sep)
+        if score[0] > 0 and score > best_score:
+            best_sep, best_score = sep, score
+
+    if best_sep is not None:
+        return best_sep
+
+    # nessun separatore ha prodotto intestazioni riconoscibili: ripiego sulla
+    # semplice presenza dei caratteri, limitando Sniffer ai delimitatori validi.
+    joined = "\n".join(lines[:20])
+    for sep in CANDIDATE_SEPS:
+        if sep in joined:
+            return sep
+    try:
+        dialect = csv.Sniffer().sniff(joined, delimiters="".join(CANDIDATE_SEPS))
+        sep = dialect.delimiter
+        return "\t" if sep.isspace() else sep
+    except Exception:
+        return r"\s+"
 
 
 def parse_rows_with_sep(decoded_text: str, sep_choice: str):
@@ -193,6 +236,19 @@ def clean_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -------------------- gestione colonne richieste --------------------
+REQUIRED_COLUMNS = ["Matricola", "Cognome", "Nome", "Data", "TurnoE"]
+
+
+def missing_required_columns(df: pd.DataFrame) -> list:
+    """Colonne indispensabili non presenti nel DataFrame letto.
+
+    Serve a non produrre piu' un PDF vuoto "con esito positivo" quando il file
+    e' stato interpretato male: meglio un errore esplicito.
+    """
+    cols = {str(c).strip().lower() for c in df.columns}
+    return [c for c in REQUIRED_COLUMNS if c.lower() not in cols]
+
+
 def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
     cols = [str(c).strip() if c is not None else "" for c in df2.columns]
@@ -434,17 +490,29 @@ if df_excel is not None:
 else:
     candidates = generate_encoding_candidates(raw, n_top=4)
     top_enc = candidates[0]["encoding"] if candidates else "utf-8"
-    snippet = candidates[0]["snippet"] if candidates else raw.decode("latin1", errors="replace")[:1000]
-    guessed_sep = guess_separator_from_text(snippet)
     enc_to_use = top_enc
-    sep_to_use = guessed_sep
     try:
         decoded_full = raw.decode(enc_to_use)
     except Exception:
         decoded_full = raw.decode(enc_to_use, errors="replace")
+    # il separatore va cercato sul testo completo, non sullo snippet di 1000
+    # caratteri: lo snippet tronca a meta' riga e falsa il riconoscimento.
+    sep_to_use = guess_separator_from_text(decoded_full)
     df = robust_read_text_to_df(decoded_full, sep_to_use)
 
 df = clean_dataframe_strings(df)
+
+missing = missing_required_columns(df)
+if missing:
+    st.error(
+        "Il file e' stato letto ma non sono state riconosciute le colonne: "
+        + ", ".join(missing)
+        + ". Colonne trovate: "
+        + ", ".join(str(c) for c in df.columns)
+        + ". Controlla che il tracciato sia il 'Riepilogo Mensile per Excel - Dettagliato DB'."
+    )
+    st.stop()
+
 df_sel = select_required_columns(df)
 
 # preparazione valore ordinabile per Data
